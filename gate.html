@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="robots" content="noindex, nofollow, noarchive" />
+  <meta name="referrer" content="no-referrer" />
+  <meta name="theme-color" content="#05080d" />
+  <link rel="icon" type="image/png" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <title>Playtest</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
+      background: #05080d; color: #d7e6f2; font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    form { width: min(360px, 100%); display: grid; gap: 12px; padding: 22px; border: 1px solid rgba(53, 224, 216, 0.35);
+      border-radius: 12px; background: #0a111a; box-shadow: 0 0 24px rgba(53, 224, 216, 0.12); }
+    h1 { margin: 0; font-size: 1.15rem; color: #35e0d8; letter-spacing: 0.02em; }
+    label { font-size: 0.85rem; color: #7d93a8; }
+    input { width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid #28415a; background: #05080d;
+      color: inherit; font-size: 1rem; }
+    input:focus { outline: 2px solid #35e0d8; outline-offset: 1px; }
+    button { padding: 11px 12px; border-radius: 8px; border: 1px solid #35e0d8; background: rgba(53, 224, 216, 0.12);
+      color: #35e0d8; font-size: 1rem; font-weight: 600; }
+    button:disabled { opacity: 0.55; }
+    .status { min-height: 1.3em; margin: 0; font-size: 0.9rem; color: #ff8fa3; }
+    .status.busy { color: #7d93a8; }
+  </style>
+</head>
+<body>
+  <form id="gate" autocomplete="off">
+    <h1>Playtest</h1>
+    <label for="password">Contraseña · Password</label>
+    <input id="password" type="password" autocomplete="current-password" required autofocus />
+    <button id="enter" type="submit">Entrar · Enter</button>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+  </form>
+  <script>
+// --- sealed-crypto begin ---
+const SEAL_ITERATIONS = 600000;
+const sealEncoder = new TextEncoder();
+
+function sealB64(bytes) {
+  let text = '';
+  for (const byte of new Uint8Array(bytes)) text += String.fromCharCode(byte);
+  return btoa(text);
+}
+
+function sealUnB64(text) {
+  return Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+}
+
+/** The password's key-encryption key for a lock's salt. */
+async function sealPasswordKey(password, salt, iterations = SEAL_ITERATIONS) {
+  const base = await crypto.subtle.importKey('raw', sealEncoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, base,
+    { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+/** Opens a lock with a password: the content key (non-extractable), or null if the password is wrong. */
+async function sealUnlock(lock, password) {
+  const kek = await sealPasswordKey(password, sealUnB64(lock.salt), lock.iterations);
+  try {
+    const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: sealUnB64(lock.iv), additionalData: sealEncoder.encode('lbcb-lock') },
+      kek, sealUnB64(lock.wrapped));
+    return crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']);
+  } catch {
+    return null;
+  }
+}
+
+/** Decrypts one sealed file (IV followed by ciphertext) stored under `path`. */
+async function sealOpen(contentKey, path, sealed) {
+  const bytes = new Uint8Array(sealed);
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12), additionalData: sealEncoder.encode(path) },
+    contentKey, bytes.slice(12));
+}
+// --- sealed-crypto end ---
+
+// --- sealed-keystore begin ---
+/* The content key, kept in IndexedDB as a non-extractable CryptoKey (page and worker share it). */
+function sealDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('lbcb-sealed', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('keys');
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function sealKeyStore(mode, action) {
+  const db = await sealDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('keys', mode);
+    const request = action(tx.objectStore('keys'));
+    tx.oncomplete = () => { db.close(); resolve(request.result); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+async function sealKeyGet() {
+  try { return (await sealKeyStore('readonly', (store) => store.get('content'))) ?? null; } catch { return null; }
+}
+
+function sealKeyPut(key) {
+  return sealKeyStore('readwrite', (store) => store.put(key, 'content'));
+}
+
+function sealKeyClear() {
+  return sealKeyStore('readwrite', (store) => store.delete('content')).catch(() => undefined);
+}
+// --- sealed-keystore end ---
+
+    (async () => {
+      const form = document.getElementById('gate');
+      const input = document.getElementById('password');
+      const button = document.getElementById('enter');
+      const status = document.getElementById('status');
+      const say = (text, busy = false) => { status.textContent = text; status.className = busy ? 'status busy' : 'status'; };
+      if (!('serviceWorker' in navigator) || !window.isSecureContext || !crypto.subtle) {
+        say('Este navegador no puede abrir el juego · This browser cannot open the game.');
+        button.disabled = true;
+        return;
+      }
+      /** Registers the decrypting worker and reloads under its control. */
+      async function enter() {
+        say('Abriendo… · Opening…', true);
+        await navigator.serviceWorker.register('sw.js', { scope: './', updateViaCache: 'none' });
+        await navigator.serviceWorker.ready;
+        if (!navigator.serviceWorker.controller) {
+          await new Promise((resolve) => {
+            navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+            setTimeout(resolve, 4000);
+          });
+        }
+        location.replace('./');
+      }
+      // A phone that already has the key only needs the worker.
+      if (await sealKeyGet()) { await enter(); return; }
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        button.disabled = true;
+        say('Comprobando… · Checking…', true);
+        try {
+          const lock = await (await fetch('lock.json', { cache: 'no-store' })).json();
+          const key = await sealUnlock(lock, input.value);
+          if (!key) {
+            say('Contraseña incorrecta · Wrong password');
+            button.disabled = false;
+            input.select();
+            return;
+          }
+          input.value = '';
+          await sealKeyPut(key);
+          await enter();
+        } catch {
+          say('No se pudo abrir; revisa la conexión · Could not open; check the connection.');
+          button.disabled = false;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
